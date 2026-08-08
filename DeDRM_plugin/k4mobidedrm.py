@@ -25,52 +25,21 @@ __version__ = '6.0'
 
 # Changelog
 #  1.0 - Name change to k4mobidedrm. Adds Mac support, Adds plugin code
-#  1.1 - Adds support for additional kindle.info files
-#  1.2 - Better error handling for older Mobipocket
-#  1.3 - Don't try to decrypt Topaz books
-#  1.7 - Add support for Topaz books and Kindle serial numbers. Split code.
-#  1.9 - Tidy up after Topaz, minor exception changes
-#  2.1 - Topaz fix and filename sanitizing
-#  2.2 - Topaz Fix and minor Mac code fix
-#  2.3 - More Topaz fixes
-#  2.4 - K4PC/Mac key generation fix
-#  2.6 - Better handling of non-K4PC/Mac ebooks
-#  2.7 - Better trailing bytes handling in mobidedrm
-#  2.8 - Moved parsing of kindle.info files to mac & pc util files.
-#  3.1 - Updated for new calibre interface. Now __init__ in plugin.
-#  3.5 - Now support Kindle for PC/Mac 1.6
-#  3.6 - Even better trailing bytes handling in mobidedrm
-#  3.7 - Add support for Amazon Print Replica ebooks.
-#  3.8 - Improved Topaz support
-#  4.1 - Improved Topaz support and faster decryption with alfcrypto
-#  4.2 - Added support for Amazon's KF8 format ebooks
-#  4.4 - Linux calls to Wine added, and improved configuration dialog
-#  4.5 - Linux works again without Wine. Some Mac key file search changes
-#  4.6 - First attempt to handle unicode properly
-#  4.7 - Added timing reports, and changed search for Mac key files
-#  4.8 - Much better unicode handling, matching the updated inept and ignoble scripts
-#      - Moved back into plugin, __init__ in plugin now only contains plugin code.
-#  4.9 - Missed some invalid characters in cleanup_name
-#  5.0 - Extraction of info from Kindle for PC/Mac moved into kindlekey.py
-#      - tweaked GetDecryptedBook interface to leave passed parameters unchanged
-#  5.1 - moved unicode_argv call inside main for Windows DeDRM compatibility
-#  5.2 - Fixed error in command line processing of unicode arguments
-#  5.3 - Changed Android support to allow passing of backup .ab files
-#  5.4 - Recognise KFX files masquerading as azw, even if we can't decrypt them yet.
-#  5.5 - Added GPL v3 licence explicitly.
-#  5.6 - Invoke KFXZipBook to handle zipped KFX files
-#  5.7 - Revamp cleanup_name
+#  ...
 #  6.0 - Added Python 3 compatibility for calibre 5.0
 
 
-import sys, os, re
-import csv
-import getopt
+import sys
+import os
 import re
+import getopt
 import traceback
 import time
 import html.entities
 import json
+import argparse
+import logging
+from pathlib import Path
 
 class DrmException(Exception):
     pass
@@ -99,14 +68,44 @@ else:
 class SafeUnbuffered:
     def __init__(self, stream):
         self.stream = stream
-        self.encoding = stream.encoding
-        if self.encoding == None:
-            self.encoding = "utf-8"
+        enc = getattr(stream, 'encoding', None)
+        self.encoding = enc or 'utf-8'
+
     def write(self, data):
-        if isinstance(data, str):
-            data = data.encode(self.encoding,"replace")
-        self.stream.buffer.write(data)
-        self.stream.buffer.flush()
+        # Accept bytes or str. Prefer writing text via stream.write.
+        try:
+            if isinstance(data, bytes):
+                # decode bytes to text using the stream encoding, fall back gracefully
+                try:
+                    text = data.decode(self.encoding)
+                except Exception:
+                    text = data.decode('utf-8', 'replace')
+                self.stream.write(text)
+            else:
+                # assume text
+                self.stream.write(str(data))
+        except Exception:
+            # fallback: if the underlying stream exposes a buffer, write bytes there
+            buf = getattr(self.stream, 'buffer', None)
+            try:
+                if buf is not None:
+                    if isinstance(data, str):
+                        buf.write(data.encode(self.encoding, 'replace'))
+                    else:
+                        buf.write(data)
+            except Exception:
+                # give up silently to avoid masking original errors during logging
+                pass
+        # try to flush whichever flushing method is available
+        try:
+            self.stream.flush()
+        except Exception:
+            try:
+                buf = getattr(self.stream, 'buffer', None)
+                if buf is not None:
+                    buf.flush()
+            except Exception:
+                pass
 
     def __getattr__(self, attr):
         return getattr(self.stream, attr)
@@ -118,11 +117,6 @@ def unicode_argv():
     if iswindows:
         # Uses shell32.GetCommandLineArgvW to get sys.argv as a list of Unicode
         # strings.
-
-        # Versions 2.x of Python don't support Unicode in sys.argv on
-        # Windows, with the underlying Windows API instead replacing multi-byte
-        # characters with '?'.
-
 
         from ctypes import POINTER, byref, cdll, c_int, windll
         from ctypes.wintypes import LPCWSTR, LPWSTR
@@ -143,8 +137,6 @@ def unicode_argv():
             start = argc.value - len(sys.argv)
             return [argv[i] for i in
                     range(start, argc.value)]
-        # if we don't have any arguments at all, just pass back script name
-        # this should never happen
         return ["mobidedrm.py"]
     else:
         argvencoding = sys.stdin.encoding or "utf-8"
@@ -158,7 +150,7 @@ def unicode_argv():
 # and some improvements suggested by jhaisley
 def cleanup_name(name):
     # substitute filename unfriendly characters
-    name = name.replace("<","[").replace(">","]").replace(" : "," – ").replace(": "," – ").replace(":","—").replace("/","_").replace("\\","_").replace("|","_").replace("\"","\'").replace("*","_").replace("?","")
+    name = name.replace("<","[").replace(">","]").replace(" : "," – ").replace(": "," – ").replace(":","—").replace("/","_").replace("\\","_").replace("|","_").replace('"',"'").replace("*","_")
     # white space to single space, delete leading and trailing while space
     name = re.sub(r"\s", " ", name).strip()
     # delete control characters
@@ -197,13 +189,19 @@ def unescape(text):
         return text # leave as is
     return re.sub("&#?\\w+;", fixup, text)
 
-def GetDecryptedBook(infile, kDatabases, androidFiles, serials, pids, starttime = time.time()):
+def GetDecryptedBook(infile, kDatabases, androidFiles, serials, pids, starttime=None):
     # handle the obvious cases at the beginning
+    if starttime is None:
+        starttime = time.time()
+
     if not os.path.isfile(infile):
         raise DrmException("Input file does not exist.")
 
     mobi = True
-    magic8 = open(infile,'rb').read(8)
+    # read magic bytes with a context manager to avoid leaking file descriptors
+    with open(infile, 'rb') as fh:
+        magic8 = fh.read(8)
+
     if magic8 == b'\xeaDRMION\xee':
         raise DrmException("The .kfx DRMION file cannot be decrypted by itself. A .kfx-zip archive containing a DRM voucher is required.")
 
@@ -211,6 +209,7 @@ def GetDecryptedBook(infile, kDatabases, androidFiles, serials, pids, starttime 
     if magic3 == b'TPZ':
         mobi = False
 
+    # instantiate the appropriate book handler
     if magic8[:4] == b'PK\x03\x04':
         mb = kfxdedrm.KFXZipBook(infile)
     elif mobi:
@@ -219,30 +218,41 @@ def GetDecryptedBook(infile, kDatabases, androidFiles, serials, pids, starttime 
         mb = topazextract.TopazBook(infile)
 
     bookname = unescape(mb.getBookTitle())
-    print("Decrypting {1} ebook: {0}".format(bookname, mb.getBookType()))
+    logging.info("Decrypting %s ebook: %s", mb.getBookType(), bookname)
 
     # copy list of pids
     totalpids = list(pids)
     # extend list of serials with serials from android databases
     for aFile in androidFiles:
-        serials.extend(androidkindlekey.get_serials(aFile))
-    # extend PID list with book-specific PIDs from seriala and kDatabases
+        try:
+            serials.extend(androidkindlekey.get_serials(aFile))
+        except Exception:
+            logging.exception("Error reading Android serials from %s", aFile)
+    # extend PID list with book-specific PIDs from serials and kDatabases
     md1, md2 = mb.getPIDMetaInfo()
-    totalpids.extend(kgenpids.getPidList(md1, md2, serials, kDatabases))
+    try:
+        totalpids.extend(kgenpids.getPidList(md1, md2, serials, kDatabases))
+    except Exception:
+        logging.exception("Error generating PID list for %s", infile)
     # remove any duplicates
     totalpids = list(set(totalpids))
-    print("Found {1:d} keys to try after {0:.1f} seconds".format(time.time()-starttime, len(totalpids)))
-    #print totalpids
+    logging.info("Found %d keys to try after %.1f seconds", len(totalpids), time.time()-starttime)
 
     try:
         mb.processBook(totalpids)
-    except:
-        mb.cleanup
+    except Exception:
+        # ensure cleanup is attempted when an error occurs
+        try:
+            if 'mb' in locals() and hasattr(mb, 'cleanup'):
+                cleanup = getattr(mb, 'cleanup')
+                if callable(cleanup):
+                    cleanup()
+        except Exception:
+            logging.exception("Error while cleaning up after failed decryption")
         raise
 
-    print("Decryption succeeded after {0:.1f} seconds".format(time.time()-starttime))
+    logging.info("Decryption succeeded after %.1f seconds", time.time()-starttime)
     return mb
-
 
 # kDatabaseFiles is a list of files created by kindlekey
 def decryptBook(infile, outdir, kDatabaseFiles, androidFiles, serials, pids):
@@ -251,27 +261,23 @@ def decryptBook(infile, outdir, kDatabaseFiles, androidFiles, serials, pids):
     for dbfile in kDatabaseFiles:
         kindleDatabase = {}
         try:
-            with open(dbfile, 'r') as keyfilein:
-                kindleDatabase = json.loads(keyfilein.read())
-            kDatabases.append([dbfile,kindleDatabase])
-        except Exception as e:
-            print("Error getting database from file {0:s}: {1:s}".format(dbfile,e))
-            traceback.print_exc()
-
-
+            with open(dbfile, 'r', encoding='utf-8') as keyfilein:
+                kindleDatabase = json.load(keyfilein)
+            kDatabases.append([dbfile, kindleDatabase])
+        except Exception:
+            logging.exception("Error getting database from file %s", dbfile)
 
     try:
         book = GetDecryptedBook(infile, kDatabases, androidFiles, serials, pids, starttime)
     except Exception as e:
-        print("Error decrypting book after {1:.1f} seconds: {0}".format(e.args[0],time.time()-starttime))
-        traceback.print_exc()
+        logging.exception("Error decrypting book after %.1f seconds: %s", time.time()-starttime, str(e))
         return 1
 
     # Try to infer a reasonable name
     orig_fn_root = os.path.splitext(os.path.basename(infile))[0]
     if (
-        re.match('^B[A-Z0-9]{9}(_EBOK|_EBSP|_sample)?$', orig_fn_root) or
-        re.match('^{0-9A-F-}{36}$', orig_fn_root)
+        re.match(r'^B[A-Z0-9]{9}(_EBOK|_EBSP|_sample)?$', orig_fn_root) or
+        re.match(r'^[0-9A-F-]{36}$', orig_fn_root)
     ):  # Kindle for PC / Mac / Android / Fire / iOS
         clean_title = cleanup_name(book.getBookTitle())
         outfilename = "{}_{}".format(orig_fn_root, clean_title)
@@ -279,22 +285,46 @@ def decryptBook(infile, outdir, kDatabaseFiles, androidFiles, serials, pids):
         outfilename = orig_fn_root
 
     # avoid excessively long file names
-    if len(outfilename)>150:
-        outfilename = outfilename[:99]+"--"+outfilename[-49:]
+    if len(outfilename) > 150:
+        outfilename = outfilename[:99] + "--" + outfilename[-49:]
 
-    outfilename = outfilename+"_nodrm"
+    outfilename = outfilename + "_nodrm"
+
+    # ensure outdir exists
+    try:
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logging.exception("Unable to create output directory %s", outdir)
+        return 1
+
     outfile = os.path.join(outdir, outfilename + book.getBookExtension())
 
-    book.getFile(outfile)
-    print("Saved decrypted book {1:s} after {0:.1f} seconds".format(time.time()-starttime, outfilename))
+    try:
+        book.getFile(outfile)
+        logging.info("Saved decrypted book %s after %.1f seconds", outfilename, time.time()-starttime)
+    except Exception:
+        logging.exception("Error saving decrypted book %s", outfilename)
+        try:
+            if hasattr(book, 'cleanup'):
+                book.cleanup()
+        except Exception:
+            logging.exception("Error during cleanup after failed save")
+        return 1
 
-    if book.getBookType()=="Topaz":
-        zipname = os.path.join(outdir, outfilename + "_SVG.zip")
-        book.getSVGZip(zipname)
-        print("Saved SVG ZIP Archive for {1:s} after {0:.1f} seconds".format(time.time()-starttime, outfilename))
+    if book.getBookType() == "Topaz":
+        try:
+            zipname = os.path.join(outdir, outfilename + "_SVG.zip")
+            book.getSVGZip(zipname)
+            logging.info("Saved SVG ZIP Archive for %s after %.1f seconds", outfilename, time.time()-starttime)
+        except Exception:
+            logging.exception("Error saving SVG ZIP Archive for %s", outfilename)
 
     # remove internal temporary directory of Topaz pieces
-    book.cleanup()
+    try:
+        if hasattr(book, 'cleanup'):
+            book.cleanup()
+    except Exception:
+        logging.exception("Error during final cleanup for %s", outfilename)
     return 0
 
 
@@ -307,52 +337,35 @@ def usage(progname):
 # Main
 #
 def cli_main():
-    argv=unicode_argv()
+    # prefer argparse for the CLI and configure logging
+    argv = unicode_argv()
     progname = os.path.basename(argv[0])
-    print("K4MobiDeDrm v{0}.\nCopyright © 2008-2020 Apprentice Harper et al.".format(__version__))
 
-    try:
-        opts, args = getopt.getopt(argv[1:], "k:p:s:a:h")
-    except getopt.GetoptError as err:
-        print("Error in options or arguments: {0}".format(err.args[0]))
-        usage(progname)
-        sys.exit(2)
-    if len(args)<2:
-        usage(progname)
-        sys.exit(2)
+    parser = argparse.ArgumentParser(prog=progname,
+                                     description='Removes DRM protection from Mobipocket, Amazon KF8, Amazon Print Replica and Amazon Topaz ebooks')
+    parser.add_argument('-k', '--keyfile', action='append', default=[], help='Kindle k4i key file (can be specified multiple times)')
+    parser.add_argument('-p', '--pids', help='Comma separated PIDs')
+    parser.add_argument('-s', '--serials', help='Comma separated Kindle serial numbers')
+    parser.add_argument('-a', '--android', action='append', default=[], help='Android secure storage file(s) (can be specified multiple times)')
+    parser.add_argument('infile')
+    parser.add_argument('outdir')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
 
-    infile = args[0]
-    outdir = args[1]
-    kDatabaseFiles = []
-    androidFiles = []
-    serials = []
-    pids = []
+    args = parser.parse_args(argv[1:])
 
-    for o, a in opts:
-        if o == "-h":
-            usage(progname)
-            sys.exit(0)
-        if o == "-k":
-            if a == None :
-                raise DrmException("Invalid parameter for -k")
-            kDatabaseFiles.append(a)
-        if o == "-p":
-            if a == None :
-                raise DrmException("Invalid parameter for -p")
-            pids = a.encode('utf-8').split(b',')
-        if o == "-s":
-            if a == None :
-                raise DrmException("Invalid parameter for -s")
-            serials = a.split(',')
-        if o == '-a':
-            if a == None:
-                raise DrmException("Invalid parameter for -a")
-            androidFiles.append(a)
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format='%(levelname)s: %(message)s')
+
+    infile = args.infile
+    outdir = args.outdir
+    kDatabaseFiles = args.keyfile
+    androidFiles = args.android
+    serials = [] if not args.serials else [s.strip() for s in args.serials.split(',') if s.strip()]
+    pids = [] if not args.pids else [pid.strip() for pid in args.pids.split(',') if pid.strip()]
 
     return decryptBook(infile, outdir, kDatabaseFiles, androidFiles, serials, pids)
 
 
 if __name__ == '__main__':
-    sys.stdout=SafeUnbuffered(sys.stdout)
-    sys.stderr=SafeUnbuffered(sys.stderr)
+    sys.stdout = SafeUnbuffered(sys.stdout)
+    sys.stderr = SafeUnbuffered(sys.stderr)
     sys.exit(cli_main())
