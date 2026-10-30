@@ -1,0 +1,47 @@
+0{
+	"image": "mcr.microsoft.com/devcontainers/universal:2",
+	"features": {
+		"ghcr.io/dhoeric/features/act:1": {},
+		"ghcr.io/stuartleeks/dev-container-features/add-host:1": {},
+		"ghcr.io/jsburckhardt/devcontainer-features/actionlint:1": {},
+		"ghcr.io/flexwie/devcontainer-features/op:1": {},
+		"ghcr.io/wxw-matt/devcontainer-features/command_runner:0": {},
+		"ghcr.io/wxw-matt/devcontainer-features/script_runner:0": {},
+		"ghcr.io/cirolosapio/devcontainers-features/alpine-go:0": {},
+		"ghcr.io/nikiforovall/devcontainer-features/dotnet-csharpier:1": {},
+		"ghcr.io/juan-ayala/devcontainer-features/aem-lts:1": {},
+		"ghcr.io/juan-ayala/devcontainer-features/aem-repo-tool:1": {},
+		"ghcr.io/ait-assistive-autonomous-systems/devcontainer_features/add-groups:0": {
+			"addGroups": "4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),116(lpadmin),999(docker)",
+			"excludeGroups": "file://.devcontainer/exclude_host_groups"
+		},
+		"ghcr.io/devcontainers-extra/features/act:1": {
+			"version": "latest"
+		},
+		"ghcr.io/devcontainers-extra/features/act-asdf:2": {
+			"version": "latest"
+		},
+		"ghcr.io/devcontainers-extra/features/actionlint:1": {
+			"version": "latest"
+		},
+		"ghcr.io/devcontainer-community/devcontainer-features/add-script:1": {},
+		"ghcr.io/dotnet/aspire-devcontainer-feature/dotnetaspire:1": {
+			"version": "9.0"
+		},
+		"ghcr.io/daniellindemann/dev-container-features/dotnet-usersecrets-persistence:0": {},
+		"ghcr.io/rails/devcontainer/features/activestorage:1": {
+			"variantProcessor": "mini_magick"
+		},
+		"ghcr.io/devcontainer-config/features/dot-config:4": {},
+		"ghcr.io/postfinance/devcontainer-features/dotnet:1": {
+			"version": "10.0",
+			"additionalVersions": "8.0,9.0",
+			"dotnetRuntimeVersions": "8.0.15",
+			"aspNetCoreRuntimeVersions": "lts, 8.0",
+			"workloads": "android, macos"
+		},
+		"ghcr.io/srzstephen/devcontainer-features/act:1": {
+			"version": "latest"
+		}
+	}
+}
